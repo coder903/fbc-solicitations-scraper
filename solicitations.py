@@ -387,20 +387,48 @@ def dibbs_solicitations(config, day, test_mode=False, max_records=None):
 
 def dibbs_solicitations_storage(config, rows):
     """
-    Download solicitation PDFs to storage (placeholder for now)
+    Download solicitation PDFs to storage - reentrant (skips existing files)
+    Only downloads main solicitation PDFs, not technical documents
     """
-    print("\nFiles to download:")
+    from util.storage_api import Storage
+    import requests
+    import time
+    
+    storage = Storage(config, "service")
+    session = dibbs_session(DIBBS_HOST)
+    
+    stats = {'downloaded': 0, 'skipped': 0, 'failed': 0}
+    
+    print(f"\nProcessing solicitation PDFs for {len(rows)} solicitations...")
+    
     for row in rows:
-        # Technical documents
-        if 'technical_documents' in row:
-            for doc in row['technical_documents']:
-                filename = f"{DATASET}/solicitations/{row.get('solicitation', 'unknown')}_{doc['title'].replace(' ', '_')}.pdf"
-                print(f"  Would download: {doc['url']} -> {BUCKET}/{filename}")
-        
-        # Solicitation document
+        # Only download main solicitation document
         if 'solicitation_url' in row and row['solicitation_url']:
             filename = f"{DATASET}/solicitations/{row.get('solicitation', 'unknown')}_solicitation.pdf"
-            print(f"  Would download: {row['solicitation_url']} -> {BUCKET}/{filename}")
+            
+            if storage.object_exists(bucket=BUCKET, filename=filename):
+                print(f"  Skipping (exists): {filename}")
+                stats['skipped'] += 1
+            else:
+                try:
+                    print(f"  Downloading: {row['solicitation_url']} -> {BUCKET}/{filename}")
+                    response = session.get(row['solicitation_url'], timeout=60)
+                    response.raise_for_status()
+                    
+                    storage.object_put(
+                        bucket=BUCKET,
+                        filename=filename,
+                        data=io.BytesIO(response.content),
+                        mimetype='application/pdf'
+                    )
+                    stats['downloaded'] += 1
+                    time.sleep(0.5)  # Be polite to the server
+                except Exception as e:
+                    print(f"  Failed: {row['solicitation_url']} - {str(e)}")
+                    stats['failed'] += 1
+    
+    print(f"\nPDF Download Summary: {stats['downloaded']} downloaded, {stats['skipped']} skipped, {stats['failed']} failed")
+    return stats
 
 
 def save_json_output(rows, day):
