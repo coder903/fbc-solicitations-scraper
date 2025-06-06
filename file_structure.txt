@@ -1,0 +1,13 @@
+gs://fbc-requests/
+  DIBBS/
+    SPE1C125Q0364/              # Solicitation folder
+      SPE1C125Q0364.pdf         # Solicitation PDF
+      7012469196/               # PR number folder
+        in250603.txt            # Index file
+        as250603.txt            # Approved sources
+        bq250603.txt            # Batch quote
+      7012469195/               # Another PR for same solicitation
+        in250603.txt
+        as250603.txt
+        bq250603.txt
+
