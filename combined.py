@@ -39,7 +39,8 @@ RFQ_PROJECT = 'argon-surf-426917-k8'
 DIBBS_HOST = 'https://www.dibbs.bsm.dla.mil/'
 DIBBS2_HOST = 'https://dibbs2.bsm.dla.mil/'
 BUCKET = 'fbc-requests'
-DATASET = 'DIBBS'  # Changed to DIBBS for proper file structure
+DATASET = 'DIBBS'  # For file storage structure
+BQ_DATASET = 'REQUESTS'  # For BigQuery dataset
 
 # Headers from solicitations.py
 HEADERS = {
@@ -233,12 +234,17 @@ class DIBBSUnifiedScraper:
             
         table_name = f"SOLICITATIONS_{date_str.replace('-', '_')}"
         # Check in RFQ project
-        exists = self.bq.table_exists(RFQ_PROJECT, DATASET, table_name)
+        exists = self.bq.table_exists(RFQ_PROJECT, BQ_DATASET, table_name)
         
         if exists:
-            logger.info(f"Table {RFQ_PROJECT}.{DATASET}.{table_name} already exists")
-            # Check if table has data
-            query = f"SELECT COUNT(*) as count FROM `{RFQ_PROJECT}.{DATASET}.{table_name}`"
+            logger.info(f"Table {RFQ_PROJECT}.{BQ_DATASET}.{table_name} already exists")
+            # For today's date, always return False to allow updates
+            if date_str == datetime.now().strftime('%Y-%m-%d'):
+                logger.info("  Processing today's date - will check for new records")
+                return False
+            
+            # For historical dates, check if table has data
+            query = f"SELECT COUNT(*) as count FROM `{RFQ_PROJECT}.{BQ_DATASET}.{table_name}`"
             try:
                 result = self.bq.query(query)
                 if result and result[0]['count'] > 0:
@@ -247,6 +253,25 @@ class DIBBSUnifiedScraper:
                 pass
                 
         return False
+
+    def get_existing_solicitations(self, date_str: str) -> set:
+        """Get list of solicitations already processed for a date"""
+        table_name = f"SOLICITATIONS_{date_str.replace('-', '_')}"
+        existing_solicitations = set()
+        
+        try:
+            query = f"""
+            SELECT DISTINCT solicitation_number 
+            FROM `{RFQ_PROJECT}.{BQ_DATASET}.{table_name}`
+            """
+            results = self.bq.query(query)
+            if results:
+                existing_solicitations = {row['solicitation_number'] for row in results}
+                logger.info(f"  Found {len(existing_solicitations)} existing solicitations in BigQuery")
+        except Exception as e:
+            logger.debug(f"  No existing data found: {str(e)}")
+        
+        return existing_solicitations
 
     def file_exists_in_gcs(self, filepath: str) -> bool:
         """Check if file exists in GCS"""
@@ -675,6 +700,32 @@ class DIBBSUnifiedScraper:
             if len(web_data) == 0:
                 results['warnings'].append("No solicitations found via web scrape")
             
+            # Check for existing solicitations if this is today's date
+            existing_solicitations = set()
+            is_today = date_str == datetime.now().strftime('%Y-%m-%d')
+            if is_today:
+                existing_solicitations = self.get_existing_solicitations(date_str)
+                
+                # Filter out already processed solicitations
+                new_web_data = []
+                for sol in web_data:
+                    sol_num = sol.get('solicitation', '').strip()
+                    if sol_num and sol_num not in existing_solicitations:
+                        new_web_data.append(sol)
+                
+                logger.info(f"  Found {len(new_web_data)} NEW solicitations to process")
+                if len(new_web_data) == 0:
+                    logger.info("  No new solicitations found - all already processed")
+                    results['success'] = True
+                    results['warnings'].append("No new solicitations to process")
+                    return results
+                
+                # Use only new solicitations for processing
+                web_data = new_web_data
+            
+            if len(web_data) == 0:
+                results['warnings'].append("No solicitations found via web scrape")
+            
             # Build solicitation -> PR mapping from web data
             sol_pr_map = {}
             for sol in web_data:
@@ -973,16 +1024,29 @@ class DIBBSUnifiedScraper:
                 table_id = f"SOLICITATIONS_{date_str.replace('-', '_')}"
                 
                 try:
-                    self.bq.json_to_table(
-                        project_id=RFQ_PROJECT,  # Use RFQ project instead of config.project
-                        dataset_id=DATASET,
-                        table_id=table_id,
-                        json_data=merged_data,
-                        schema=SOLICITATIONS_SCHEMA
-                    )
+                    # For today's date, append to existing table
+                    if is_today and existing_solicitations:
+                        logger.info("  Appending new records to existing table...")
+                        self.bq.json_to_table(
+                            project_id=RFQ_PROJECT,
+                            dataset_id=BQ_DATASET,
+                            table_id=table_id,
+                            json_data=merged_data,
+                            schema=SOLICITATIONS_SCHEMA,
+                            write_disposition='WRITE_APPEND'  # Append mode
+                        )
+                    else:
+                        # For historical dates or first run of the day, create/replace table
+                        self.bq.json_to_table(
+                            project_id=RFQ_PROJECT,
+                            dataset_id=BQ_DATASET,
+                            table_id=table_id,
+                            json_data=merged_data,
+                            schema=SOLICITATIONS_SCHEMA
+                        )
                     
                     results['bigquery_loaded'] = True
-                    logger.info(f"  ✓ Successfully loaded to {RFQ_PROJECT}.{DATASET}.{table_id}")
+                    logger.info(f"  ✓ Successfully loaded {len(merged_data)} records to {RFQ_PROJECT}.{BQ_DATASET}.{table_id}")
                     
                 except Exception as e:
                     logger.error(f"  ✗ Error loading to BigQuery: {str(e)}")
@@ -1001,6 +1065,8 @@ class DIBBSUnifiedScraper:
         # Summary for this date
         logger.info(f"\nSummary for {date_str}:")
         logger.info(f"  Solicitations found: {results['solicitations_count']}")
+        if is_today and existing_solicitations:
+            logger.info(f"  New solicitations processed: {len(web_data)}")
         logger.info(f"  Files uploaded: {results['files_uploaded']}")
         logger.info(f"  BigQuery loaded: {'Yes' if results['bigquery_loaded'] else 'No'}")
         logger.info(f"  Overall success: {'Yes' if results['success'] else 'No'}")
