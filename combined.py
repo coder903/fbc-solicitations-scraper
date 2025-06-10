@@ -67,7 +67,8 @@ HEADERS = {
 SOLICITATIONS_SCHEMA = [
     {"name": "solicitation_number", "type": "STRING", "mode": "REQUIRED"},
     {"name": "solicitation_date", "type": "DATE", "mode": "NULLABLE"},
-    {"name": "return_by_date", "type": "DATETIME", "mode": "NULLABLE"},
+    {"name": "issued_date", "type": "DATE", "mode": "NULLABLE"},  # Moved to top level
+    {"name": "return_by_date", "type": "DATETIME", "mode": "NULLABLE"},  # Already here
     {"name": "posted_date", "type": "DATE", "mode": "NULLABLE"},
     {"name": "last_updated", "type": "TIMESTAMP", "mode": "NULLABLE"},
     
@@ -79,6 +80,7 @@ SOLICITATIONS_SCHEMA = [
     {"name": "days_quote_valid", "type": "INTEGER", "mode": "NULLABLE"},
     {"name": "fob_point", "type": "STRING", "mode": "NULLABLE"},
     {"name": "inspection_point", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "amsc", "type": "STRING", "mode": "NULLABLE"},  # Added AMSC field
     
     {"name": "guaranteed_minimum", "type": "INTEGER", "mode": "NULLABLE"},
     {"name": "do_minimum", "type": "INTEGER", "mode": "NULLABLE"},
@@ -94,14 +96,12 @@ SOLICITATIONS_SCHEMA = [
             {"name": "nsn", "type": "STRING", "mode": "NULLABLE"},
             {"name": "part_number", "type": "STRING", "mode": "NULLABLE"},
             {"name": "nomenclature", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "purchase_request", "type": "STRING", "mode": "NULLABLE"},
             {"name": "pr_number", "type": "STRING", "mode": "NULLABLE"},
             {"name": "quantity", "type": "INTEGER", "mode": "NULLABLE"},
             {"name": "unit_of_issue", "type": "STRING", "mode": "NULLABLE"},
             {"name": "unit_price", "type": "FLOAT", "mode": "NULLABLE"},
             {"name": "delivery_days", "type": "INTEGER", "mode": "NULLABLE"},
-            {"name": "issued_date", "type": "DATE", "mode": "NULLABLE"},
-            {"name": "return_by", "type": "DATE", "mode": "NULLABLE"},
+            # Removed issued_date and return_by from here
             
             {
                 "name": "technical_documents",
@@ -120,7 +120,6 @@ SOLICITATIONS_SCHEMA = [
                 "fields": [
                     {"name": "supplier_cage_code", "type": "STRING", "mode": "NULLABLE"},
                     {"name": "supplier_part_number", "type": "STRING", "mode": "NULLABLE"},
-                    {"name": "supplier_name", "type": "STRING", "mode": "NULLABLE"},
                 ]
             }
         ]
@@ -226,6 +225,49 @@ class DIBBSUnifiedScraper:
         # Create sessions
         self.session_dibbs = dibbs_session(DIBBS_HOST)
         self.session_dibbs2 = dibbs_session(DIBBS2_HOST, verify=False)
+
+    def clean_nsn(self, nsn_value: str) -> str:
+        """Clean NSN by removing text suffixes like 'MilSpec'"""
+        if not nsn_value:
+            return ''
+        
+        # Remove everything after the first space
+        cleaned = nsn_value.split(' ')[0].strip()
+        
+        # Remove any non-numeric characters except hyphens
+        # Keep hyphens for part numbers that might have them
+        return cleaned
+
+    def extract_quantity_from_purchase_request(self, purchase_request: str) -> Tuple[str, Optional[int]]:
+        """Extract quantity from purchase request and return cleaned PR and quantity"""
+        if not purchase_request:
+            return '', None
+        
+        # Look for "QTY: X" pattern
+        import re
+        qty_pattern = r'\s*QTY:\s*(\d+(?:,\d+)*)\s*'
+        match = re.search(qty_pattern, purchase_request, re.IGNORECASE)
+        
+        if match:
+            # Extract quantity and remove commas
+            qty_str = match.group(1).replace(',', '')
+            quantity = int(qty_str)
+            
+            # Remove the QTY part from purchase request
+            cleaned_pr = re.sub(qty_pattern, '', purchase_request, flags=re.IGNORECASE).strip()
+            
+            return cleaned_pr, quantity
+        
+        return purchase_request.strip(), None
+
+    def clean_nomenclature(self, nomenclature: str) -> str:
+        """Clean nomenclature field"""
+        if not nomenclature:
+            return ''
+        
+        # Remove extra spaces and normalize
+        return ' '.join(nomenclature.split())
+
         
     def check_date_exists(self, date_str: str) -> bool:
         """Check if date already exists in BigQuery"""
@@ -330,6 +372,12 @@ class DIBBSUnifiedScraper:
                     'small_business_setaside': line[136:137].strip() if len(line) > 136 else '',
                     'setaside_percentage': line[137:140].strip() if len(line) > 137 else ''
                 }
+                
+                # DEBUG: Log setaside info for first few records
+                if len(records) < 5:
+                    logger.debug(f"IN file record {record['solicitation_number']}: "
+                            f"setaside={record.get('small_business_setaside', 'N')}, "
+                            f"percentage={record.get('setaside_percentage', '')}")
                 
                 # Clean up NSN
                 if record['nsn_part_number']:
@@ -457,9 +505,20 @@ class DIBBSUnifiedScraper:
         except:
             return None
     
+
+
     def merge_data_sources(self, web_data: List[Dict], in_data: List[Dict], 
-                          bq_data: List[Dict], as_data: List[Dict]) -> List[Dict]:
+                    bq_data: List[Dict], as_data: List[Dict]) -> List[Dict]:
         """Merge data from different sources into unified structure"""
+        
+        # Add debug counters
+        debug_stats = {
+            'web_solicitations': set(),
+            'bq_solicitations': set(),
+            'matched_solicitations': set(),
+            'web_only': set(),
+            'bq_only': set()
+        }
         
         # Create lookup dictionaries
         in_lookup = {record['solicitation_number']: record for record in in_data}
@@ -469,6 +528,13 @@ class DIBBSUnifiedScraper:
             if key not in bq_lookup:
                 bq_lookup[key] = []
             bq_lookup[key].append(record)
+            debug_stats['bq_solicitations'].add(record['solicitation_number'])
+        
+        # Track web solicitations
+        for record in web_data:
+            sol_num = record.get('solicitation', '').strip()
+            if sol_num:
+                debug_stats['web_solicitations'].add(sol_num)
         
         # Create AS lookup by NSN
         as_lookup = {}
@@ -481,55 +547,161 @@ class DIBBSUnifiedScraper:
         # Process each solicitation
         solicitations = {}
         
-        # Start with web scrape data if available
+        # Start with BQ data first (has proper CLIN numbers)
+        for key, records in bq_lookup.items():
+            sol_num = key[0]
+            
+            # Clean the solicitation number (remove any suffixes)
+            sol_num_clean = sol_num.strip().upper()
+            
+            if sol_num_clean not in solicitations:
+                solicitations[sol_num_clean] = {
+                    'solicitation_number': sol_num_clean,
+                    'clins': [],
+                    'scrape_timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'data_source': 'batch_quote',
+                    'last_updated': datetime.utcnow().isoformat() + 'Z'
+                }
+            
+            sol = solicitations[sol_num_clean]
+            
+            # Use first record for header data
+            if records:
+                first = records[0]
+                sol.update({
+                    'solicitation_type': first.get('solicitation_type'),
+                    'small_business_setaside': first.get('small_business_setaside'),
+                    'additional_clause_fillins': first.get('additional_clause_fillins') == 'Y',
+                    'return_by_date': self.parse_date(first.get('return_by_date')),
+                })
+            
+            # Process each line item with cleaning
+            for record in records:
+                # NSN is the government number (cleaned, no dashes)
+                nsn_raw = record.get('nsn_part_number', '')
+                nsn_clean = nsn_raw.replace('-', '') if nsn_raw else ''
+                
+                # Part number initially same as raw value (will be updated from approved sources)
+                part_number = nsn_raw  # Keep original format with dashes if present
+                
+                # Use proper CLIN number from BQ data
+                clin_number = record.get('line_number', '').zfill(4)  # Ensure 4 digits with leading zeros
+                
+                clin = {
+                    'clin': clin_number,
+                    'nsn': nsn_clean,  # Clean NSN without dashes
+                    'part_number': part_number,  # Will be updated from approved sources
+                    'nomenclature': self.clean_nomenclature(record.get('nomenclature', '')),
+                    'pr_number': record.get('purchase_request'),
+                    'quantity': self._parse_int(record.get('quantity')),
+                    'unit_of_issue': record.get('unit_of_issue'),
+                    'unit_price': self._parse_float(record.get('unit_price')),
+                    'delivery_days': self._parse_int(record.get('delivery_days')),
+                    'approved_sources': []
+                }
+                sol['clins'].append(clin)
+                
+                # Store raw BQ data
+                if 'raw_batch_quote_data' not in sol:
+                    sol['raw_batch_quote_data'] = []
+                sol['raw_batch_quote_data'].append(record)
+        
+        # Then process web scrape data (enhance existing solicitations or add new ones)
         for record in web_data:
             sol_num = record.get('solicitation', '').strip()
             if not sol_num:
                 continue
+            
+            # Clean the solicitation number to match BQ format
+            sol_num_clean = sol_num.strip().upper()
+            
+            # Debug: Log the matching attempt
+            if sol_num_clean in solicitations:
+                debug_stats['matched_solicitations'].add(sol_num_clean)
+                logger.debug(f"MATCHED: Web solicitation {sol_num} -> {sol_num_clean}")
+            else:
+                debug_stats['web_only'].add(sol_num_clean)
+                logger.debug(f"NOT MATCHED: Web solicitation {sol_num} -> {sol_num_clean}")
                 
-            if sol_num not in solicitations:
-                solicitations[sol_num] = {
-                    'solicitation_number': sol_num,
+            if sol_num_clean not in solicitations:
+                solicitations[sol_num_clean] = {
+                    'solicitation_number': sol_num_clean,
                     'clins': [],
                     'scrape_timestamp': datetime.utcnow().isoformat() + 'Z',
                     'data_source': 'web_scrape',
                     'last_updated': datetime.utcnow().isoformat() + 'Z'
                 }
             
-            # Add web scrape fields
-            sol = solicitations[sol_num]
+            sol = solicitations[sol_num_clean]
+            
+            # Update data source to indicate both sources
+            if sol['data_source'] == 'batch_quote':
+                sol['data_source'] = 'batch_quote_and_web_scrape'
+            
+            # Add web scrape specific fields INCLUDING DATES AT SOLICITATION LEVEL
             sol.update({
                 'setaside_type': record.get('setaside_type'),
                 'rfq_quote_status': record.get('rfq_quote_status'),
+                'issued_date': self.parse_date(record.get('issued', '')),  # Now at solicitation level
                 'links': {
                     'solicitation_url': record.get('solicitation_url'),
                 }
             })
             
-            # Parse dates properly
-            issued_date = self.parse_date(record.get('issued', ''))
-            return_by_date = self.parse_date(record.get('return_by', ''))
+            # Debug: Log if issued_date was set
+            if sol.get('issued_date'):
+                logger.debug(f"Set issued_date for {sol_num_clean}: {sol['issued_date']}")
+            else:
+                logger.debug(f"No issued_date for {sol_num_clean}, raw value was: {record.get('issued', 'MISSING')}")
             
-            # Add CLIN data
-            clin = {
-                'nsn': record.get('nsn_part_number', '').replace('-', ''),
-                'part_number': record.get('nsn_part_number'),
-                'nomenclature': record.get('nomenclature'),
-                'purchase_request': record.get('purchase_request'),
-                'pr_number': record.get('pr_number'),
-                'quantity': self._parse_int(record.get('quantity')),
-                'issued_date': issued_date,
-                'return_by': return_by_date,
-                'technical_documents': record.get('technical_documents', [])
-            }
+            # Update return_by_date if not already set
+            if not sol.get('return_by_date'):
+                sol['return_by_date'] = self.parse_date(record.get('return_by', ''))
             
-            # Add item/line number if available
-            if record.get('item_number'):
-                clin['clin'] = record.get('item_number')
+            # Clean and extract data
+            raw_nsn = record.get('nsn_part_number', '')
+            clean_nsn = self.clean_nsn(raw_nsn)
+            clean_pr, extracted_qty = self.extract_quantity_from_purchase_request(
+                record.get('purchase_request', '')
+            )
+            clean_nomenclature = self.clean_nomenclature(record.get('nomenclature', ''))
             
-            sol['clins'].append(clin)
+            # Use extracted quantity if available, otherwise use original quantity
+            final_quantity = extracted_qty if extracted_qty is not None else self._parse_int(record.get('quantity'))
+            
+            # Try to match with existing CLIN by NSN
+            existing_clin = None
+            for clin in sol['clins']:
+                if clin['nsn'] == clean_nsn:
+                    existing_clin = clin
+                    break
+            
+            if existing_clin:
+                # Enhance existing CLIN with web scrape data
+                existing_clin.update({
+                    'technical_documents': record.get('technical_documents', [])
+                })
+                # Only update fields if they're missing from BQ data
+                if not existing_clin.get('nomenclature'):
+                    existing_clin['nomenclature'] = clean_nomenclature
+                if not existing_clin.get('pr_number'):
+                    existing_clin['pr_number'] = clean_pr
+                if not existing_clin.get('quantity'):
+                    existing_clin['quantity'] = final_quantity
+            else:
+                # Create new CLIN without CLIN number (web scrape doesn't have reliable CLIN numbers)
+                new_clin = {
+                    'clin': None,
+                    'nsn': clean_nsn,  # Clean NSN
+                    'part_number': raw_nsn,  # Keep original value
+                    'nomenclature': clean_nomenclature,
+                    'pr_number': clean_pr,
+                    'quantity': final_quantity,
+                    'technical_documents': record.get('technical_documents', [])
+                }
+                sol['clins'].append(new_clin)
         
-        # Process IN file data
+        # Process IN file data (fill in missing fields)
         for record in in_data:
             sol_num = record['solicitation_number']
             
@@ -544,100 +716,103 @@ class DIBBSUnifiedScraper:
             
             sol = solicitations[sol_num]
             
-            # Add IN file specific data
+            # Add IN file specific data INCLUDING AMSC
             setaside = self.decode_setaside(record.get('small_business_setaside', 'N'))
+            
+            # Parse the percentage from IN file
+            setaside_pct_str = record.get('setaside_percentage', '').strip()
+            if setaside_pct_str and setaside_pct_str.isdigit():
+                setaside_pct = float(setaside_pct_str)
+            else:
+                # Use default from decode_setaside
+                setaside_pct = setaside['percentage']
+            
+            # Update solicitation with IN file data
             sol.update({
                 'small_business_setaside': setaside['code'],
-                'setaside_percentage': float(record.get('setaside_percentage', 0)) if record.get('setaside_percentage') else setaside['percentage'],
-                'return_by_date': self.parse_date(record.get('return_by_date'), '%m%d%y')
+                'setaside_percentage': setaside_pct,
+                'setaside_type': setaside['description'],  # This gives you the descriptive text
+                'return_by_date': self.parse_date(record.get('return_by_date'), '%m%d%y'),
+                'amsc': record.get('amsc', '')
             })
             
-            # Add CLIN if not already present
-            nsn_clean = record.get('nsn_clean', '')
-            if nsn_clean and not any(c['nsn'] == nsn_clean for c in sol['clins']):
-                clin = {
-                    'nsn': nsn_clean,
-                    'part_number': record.get('nsn_part_number'),
-                    'nomenclature': record.get('nomenclature'),
-                    'purchase_request': record.get('purchase_request'),
+            # Try to enhance existing CLINs with IN file data
+            clean_nsn = self.clean_nsn(record.get('nsn_part_number', ''))
+            nsn_clean = record.get('nsn_clean', clean_nsn)
+            
+            existing_clin = None
+            for clin in sol['clins']:
+                if clin['nsn'] == nsn_clean:
+                    existing_clin = clin
+                    break
+            
+            if existing_clin:
+                # Enhance with IN file data if missing
+                if not existing_clin.get('nomenclature'):
+                    existing_clin['nomenclature'] = self.clean_nomenclature(record.get('nomenclature', ''))
+                if not existing_clin.get('pr_number'):
+                    existing_clin['pr_number'] = record.get('purchase_request')
+                if not existing_clin.get('quantity'):
+                    existing_clin['quantity'] = self._parse_int(record.get('quantity'))
+                if not existing_clin.get('unit_of_issue'):
+                    existing_clin['unit_of_issue'] = record.get('unit_issue')
+            else:
+                # Create new CLIN from IN file data
+                new_clin = {
+                    'clin': None,
+                    'nsn': nsn_clean,  # Clean NSN without dashes
+                    'part_number': record.get('nsn_part_number'),  # Keep original value
+                    'nomenclature': self.clean_nomenclature(record.get('nomenclature', '')),
+                    'pr_number': record.get('purchase_request'),
                     'quantity': self._parse_int(record.get('quantity')),
                     'unit_of_issue': record.get('unit_issue')
                 }
-                sol['clins'].append(clin)
+                sol['clins'].append(new_clin)
         
-        # Process BQ file data
-        for key, records in bq_lookup.items():
-            sol_num = key[0]
-            
-            if sol_num not in solicitations:
-                solicitations[sol_num] = {
-                    'solicitation_number': sol_num,
-                    'clins': [],
-                    'scrape_timestamp': datetime.utcnow().isoformat() + 'Z',
-                    'data_source': 'batch_quote',
-                    'last_updated': datetime.utcnow().isoformat() + 'Z'
-                }
-            
-            sol = solicitations[sol_num]
-            
-            # Use first record for header data
-            if records:
-                first = records[0]
-                sol.update({
-                    'solicitation_type': first.get('solicitation_type'),
-                    'small_business_setaside': first.get('small_business_setaside'),
-                    'additional_clause_fillins': first.get('additional_clause_fillins') == 'Y',
-                    'return_by_date': self.parse_date(first.get('return_by_date')),
-                })
-            
-            # Process each line item
-            for record in records:
-                nsn_clean = record.get('nsn_clean', '')
-                
-                # Find or create CLIN
-                clin = None
-                for c in sol['clins']:
-                    if c['nsn'] == nsn_clean:
-                        clin = c
-                        break
-                
-                if not clin:
-                    clin = {
-                        'nsn': nsn_clean,
-                        'part_number': record.get('nsn_part_number'),
-                        'approved_sources': []
-                    }
-                    sol['clins'].append(clin)
-                
-                # Update CLIN with BQ data
-                clin.update({
-                    'clin': record.get('line_number'),
-                    'nomenclature': record.get('nomenclature') or clin.get('nomenclature'),
-                    'purchase_request': record.get('purchase_request') or clin.get('purchase_request'),
-                    'quantity': self._parse_int(record.get('quantity')) or clin.get('quantity'),
-                    'unit_of_issue': record.get('unit_of_issue') or clin.get('unit_of_issue'),
-                    'unit_price': self._parse_float(record.get('unit_price')),
-                    'delivery_days': self._parse_int(record.get('delivery_days')),
-                })
-                
-                # Store raw BQ data
-                if 'raw_batch_quote_data' not in sol:
-                    sol['raw_batch_quote_data'] = []
-                sol['raw_batch_quote_data'].append(record)
-        
-        # Add approved sources to CLINs
+        # Add approved sources to CLINs and update part numbers with vendor part numbers
         for sol in solicitations.values():
             for clin in sol['clins']:
                 nsn = clin.get('nsn', '')
                 if nsn and nsn in as_lookup:
-                    clin['approved_sources'] = [
+                    # Get approved sources
+                    approved_sources = [
                         {
                             'supplier_cage_code': source['supplier_cage_code'],
                             'supplier_part_number': source['supplier_part_number'],
-                            'supplier_name': source.get('supplier_name', '')
                         }
                         for source in as_lookup[nsn]
                     ]
+                    clin['approved_sources'] = approved_sources
+                    
+                    # Update part_number to vendor part number if we have approved sources
+                    # and current part_number looks like an NSN (all digits or with dashes)
+                    if approved_sources:
+                        current_part = clin.get('part_number', '').replace('-', '')
+                        # If current part number is all digits (likely NSN), replace with vendor part
+                        if current_part.isdigit() or not clin.get('part_number'):
+                            clin['part_number'] = approved_sources[0]['supplier_part_number']
+        
+        # Calculate unmatched
+        debug_stats['bq_only'] = debug_stats['bq_solicitations'] - debug_stats['matched_solicitations']
+        
+        # Print debug summary
+        logger.info("\n=== MERGE STATISTICS ===")
+        logger.info(f"Web solicitations: {len(debug_stats['web_solicitations'])}")
+        logger.info(f"BQ solicitations: {len(debug_stats['bq_solicitations'])}")
+        logger.info(f"Matched (both sources): {len(debug_stats['matched_solicitations'])}")
+        logger.info(f"Web only: {len(debug_stats['web_only'])}")
+        logger.info(f"BQ only: {len(debug_stats['bq_only'])}")
+        
+        # Show some examples of unmatched
+        if debug_stats['bq_only']:
+            logger.info(f"\nExample BQ solicitations without web match (first 5):")
+            for sol in list(debug_stats['bq_only'])[:5]:
+                logger.info(f"  - {sol}")
+        
+        if debug_stats['web_only']:
+            logger.info(f"\nExample Web solicitations without BQ match (first 5):")
+            for sol in list(debug_stats['web_only'])[:5]:
+                logger.info(f"  - {sol}")
         
         return list(solicitations.values())
     
